@@ -1,5 +1,0 @@
-PENDING REGENERATION
-
-Archived (pre-fix) version: reports/archive/graphsage_error_analysis_phase_10_8.txt
-Regenerate after retraining against the corrected feature pipeline and
-chronological split -- see reports/graphsage_improved_evaluation.txt.
