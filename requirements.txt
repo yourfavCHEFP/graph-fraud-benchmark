@@ -1,0 +1,26 @@
+# --- core data handling ---
+pandas>=2.0
+numpy>=1.24
+networkx>=3.0          # subgraph sampling & k-hop neighborhood extraction
+
+# --- reusing the trained GNN from graph-fraud-ai ---
+# only needed if you're re-running the GNN to generate predictions on new
+# subgraphs rather than reading them straight out of an existing export
+torch>=2.1
+torch-geometric>=2.5
+
+# --- scoring & analysis ---
+scikit-learn>=1.3      # accuracy/precision/recall for the assertions
+tqdm>=4.66
+
+# --- Kaggle Benchmarks SDK ---
+# confirm the exact package name in Kaggle's current docs when you set up
+# notebooks/ — this is the library that provides @kbench.task
+kaggle-benchmarks
+
+# --- notebook environment ---
+jupyter
+ipykernel
+
+# --- config / secrets ---
+python-dotenv
