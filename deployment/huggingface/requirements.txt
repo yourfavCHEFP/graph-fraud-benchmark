@@ -1,0 +1,15 @@
+# FIX (mentor review item 26): pinned to the same versions used
+# elsewhere in the project (requirements-api.txt) -- unpinned deps mean
+# a Space rebuild months from now can silently resolve a breaking
+# version and behave differently than what was actually tested.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1
+torch-geometric==2.5.3
+
+numpy
+pandas
+scikit-learn
+streamlit
+networkx
+matplotlib
+python-dotenv
