@@ -374,3 +374,57 @@ def read_responses_csv_from_rows(rows):
     frame["raw_response"] = frame["raw_response"].map(normalize_response)
     frame["response_complete"] = frame["raw_response"].ne("")
     return frame
+
+
+# --- Both attempts are reported, not just the last ------------------------
+#
+# The first real Gemma pilot failure reported only "attempt 2 returned no
+# text", hiding whether attempt 1 had raised (rate limit / proxy error) or
+# had also come back empty. Those point at different causes, so both are kept.
+
+
+def test_error_reports_every_attempt_not_just_the_last():
+    calls = []
+
+    def call(prompt):
+        calls.append(prompt)
+        return ""
+
+    with pytest.raises(EmptyModelResponseError) as excinfo:
+        request_response("p", call, "classify_transaction", 101)
+
+    message = str(excinfo.value)
+    assert "attempt 1 returned no text" in message
+    assert "attempt 2 returned no text" in message
+    assert len(calls) == 2, "still exactly two attempts -- this changes no gate"
+
+
+def test_error_distinguishes_a_raising_attempt_from_an_empty_one():
+    calls = []
+
+    def call(prompt):
+        calls.append(prompt)
+        if len(calls) == 1:
+            raise RuntimeError("429 rate limited")
+        return ""
+
+    with pytest.raises(EmptyModelResponseError) as excinfo:
+        request_response("p", call, "classify_transaction", 101)
+
+    message = str(excinfo.value)
+    assert "attempt 1 raised RuntimeError: 429 rate limited" in message
+    assert "attempt 2 returned no text" in message
+
+
+def test_retry_cap_is_not_relaxed():
+    """The empty-response retry budget stays at exactly two attempts."""
+    for max_attempts in (2,):
+        calls = []
+
+        def call(prompt):
+            calls.append(prompt)
+            return ""
+
+        with pytest.raises(EmptyModelResponseError):
+            request_response("p", call, "identify_ring_root", 7, max_attempts=max_attempts)
+        assert len(calls) == max_attempts

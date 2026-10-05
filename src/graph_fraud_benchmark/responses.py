@@ -162,28 +162,37 @@ def request_response(
     chat, a new HTTP call. Retrying by re-inspecting the same returned object
     would just rediscover the same emptiness, which is not a retry.
 
+    Every attempt's outcome is reported, not just the last one. An exception
+    on the first attempt and an empty string on it mean very different things
+    -- a rate-limited or erroring proxy versus a provider that accepted the
+    request and returned no content -- and keeping only the final attempt
+    threw that distinction away, making the first such failure impossible to
+    diagnose from the message alone.
+
     Raises :class:`EmptyModelResponseError` rather than returning "" so the
     caller cannot accidentally checkpoint an empty string as a result.
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
 
-    failure = "no attempt was made"
+    failures: list[str] = []
     for attempt in range(1, max_attempts + 1):
         try:
             raw = call(prompt)
         except Exception as exc:  # transport/HTTP failures are retryable too
-            failure = f"attempt {attempt} raised {type(exc).__name__}: {exc}"
+            failures.append(f"attempt {attempt} raised {type(exc).__name__}: {exc}")
             continue
         text = extract_response_text(raw)
         if text:
             return text
-        failure = f"attempt {attempt} returned no text ({describe_response_object(raw)})"
+        failures.append(
+            f"attempt {attempt} returned no text ({describe_response_object(raw)})"
+        )
 
     raise EmptyModelResponseError(
         f"{task_name} for seed {seed_txn_id} produced no usable text after "
-        f"{max_attempts} attempt(s): {failure}. Nothing was checkpointed for "
-        "this key, so re-running resumes it cleanly."
+        f"{max_attempts} attempt(s): " + "; ".join(failures) + ". Nothing was "
+        "checkpointed for this key, so re-running resumes it cleanly."
     )
 
 
