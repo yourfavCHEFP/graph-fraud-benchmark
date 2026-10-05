@@ -17,6 +17,12 @@ ONLY the raw text a model actually returned:
 
     model_name, task, seed_txn_id, raw_response
 
+A blank raw_response is an UNANSWERED sample, not a result. It is
+excluded from scoring and, unless require_complete=False, rejects the
+whole file -- because a CSV of the right number of rows with nothing
+in them is precisely the artifact that makes a failed run look like a
+finished leaderboard.
+
 Everything else -- labels.csv (ground truth + gnn_pred, once that
 column is filled in from the real predictions), the serialized
 prompts (for each sample's valid_txn_ids), and the raw transaction
@@ -42,18 +48,22 @@ from pathlib import Path
 import pandas as pd
 
 from .assertions import graph_awareness, score_classification, score_ring_root
+from .responses import is_complete_response, read_responses_csv
 from .tasks import _classify_logic, _ring_root_logic
 
 GNN_DECISION_THRESHOLD = 0.1980  # graph-fraud-ai's own production threshold
 
 
 def load_results(results_csv: Path) -> pd.DataFrame:
-    df = pd.read_csv(results_csv)
-    required = {"model_name", "task", "seed_txn_id", "raw_response"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"results file is missing columns: {missing}")
-    return df
+    """Load a results CSV, marking which rows are real answers.
+
+    Reading goes through responses.read_responses_csv, so a blank
+    raw_response stays the empty string instead of becoming float('nan') --
+    which is what previously made scoring a partly-empty file die with
+    AttributeError: 'float' object has no attribute 'upper'. Rows are not
+    dropped here; the response_complete column lets callers decide.
+    """
+    return read_responses_csv(results_csv)
 
 
 def load_labels(labels_csv: Path) -> pd.DataFrame:
@@ -83,9 +93,25 @@ def score_classification_rows(
     for _, row in rows.iterrows():
         seed_id = row["seed_txn_id"]
         true_label = int(labels.loc[seed_id, "label"])
+        neighbors = [t for t in valid_txn_ids.get(seed_id, []) if t != seed_id]
+        if not is_complete_response(row["raw_response"]):
+            # A blank response is not a wrong answer and not an ambiguous
+            # parse -- the model never answered. Scored unscorable, and
+            # reported so it can't be mistaken for a completed row.
+            records.append(
+                {
+                    "model_name": row["model_name"],
+                    "seed_txn_id": seed_id,
+                    "true_label": true_label,
+                    "predicted_fraud": None,
+                    "parse_confidence": "empty_response",
+                    "correct": None,
+                    "graph_aware": False,
+                }
+            )
+            continue
         parsed = _classify_logic(row["raw_response"])
         score = score_classification(parsed.predicted_fraud, parsed.parse_confidence, true_label)
-        neighbors = [t for t in valid_txn_ids.get(seed_id, []) if t != seed_id]
         aware = graph_awareness(row["raw_response"], seed_id, neighbors)
         records.append(
             {
@@ -112,7 +138,23 @@ def score_ring_root_rows(
         seed_id = row["seed_txn_id"]
         true_label = int(labels.loc[seed_id, "label"])
         candidates = valid_txn_ids.get(seed_id, [])
-        predicted_id = _ring_root_logic(row["raw_response"], candidates)
+        if not is_complete_response(row["raw_response"]):
+            # Guarded explicitly. A blank response parses to no transaction
+            # ID, which is indistinguishable from a deliberate "NONE" -- and
+            # for a legit seed "NONE" is the expected answer, scored correct.
+            # Without this check an unanswered sample would be recorded as a
+            # successful answer purely because the model said nothing.
+            records.append(
+                {
+                    "model_name": row["model_name"],
+                    "seed_txn_id": seed_id,
+                    "true_label": true_label,
+                    "predicted_txn_id": None,
+                    "correct": None,
+                }
+            )
+            continue
+        predicted_id = _ring_root_logic(row["raw_response"], candidates, seed_id)
         score = score_ring_root(predicted_id, true_label, node_is_fraud)
         records.append(
             {
@@ -221,8 +263,35 @@ def run(
     raw_transactions_csv: Path,
     out_path: Path,
     gnn_threshold: float,
+    require_complete: bool = True,
 ) -> None:
+    """Build the report card from a results CSV.
+
+    With require_complete (the default), a file containing any blank
+    raw_response is rejected before scoring: those rows are unanswered
+    samples, not wrong answers, and quietly scoring them as unscorable would
+    publish a leaderboard that looks finished but isn't. Set it False only to
+    inspect a deliberately partial run.
+    """
     results = load_results(results_csv)
+    incomplete = results[~results["response_complete"]]
+    if not incomplete.empty:
+        detail = ", ".join(
+            f"({row.model_name}, {row.task}, {row.seed_txn_id})"
+            for row in incomplete.head(10).itertuples()
+        )
+        message = (
+            f"{results_csv} holds {len(incomplete)} row(s) with a blank "
+            f"raw_response, which are unanswered samples rather than results: "
+            f"{detail}{'' if len(incomplete) <= 10 else ' (+more)'}. "
+            "Re-run the benchmark cell to recover them, or pass "
+            "require_complete=False to score only the completed rows."
+        )
+        if require_complete:
+            raise ValueError(message)
+        print(f"[analysis] WARNING: {message}")
+
+    results = results[results["response_complete"]]
     labels = load_labels(labels_csv)
     valid_txn_ids = load_valid_txn_ids(serialized_jsonl)
     node_is_fraud = load_node_is_fraud(raw_transactions_csv)
@@ -239,7 +308,8 @@ def run(
     report_card.to_json(out_path, orient="records", indent=2)
 
     print(report_card.to_string(index=False))
-    print(f"\n[analysis] wrote full report card to {out_path}")
+    print(f"\n[analysis] scored {len(results)} non-empty responses")
+    print(f"[analysis] wrote full report card to {out_path}")
 
 
 def main() -> None:

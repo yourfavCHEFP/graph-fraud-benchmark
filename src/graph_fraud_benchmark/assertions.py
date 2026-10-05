@@ -29,6 +29,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .responses import normalize_response
+
 
 @dataclass
 class ClassificationScore:
@@ -66,6 +68,9 @@ def graph_awareness(response_text: str, seed_txn_id: int, neighbor_txn_ids: list
     with it at all. Treat it as a weak, directional signal in the
     write-up, not a precise metric.
     """
+    # Normalized first: a blank results-CSV cell arrives as float('nan'),
+    # which the regex would otherwise reject with a TypeError.
+    response_text = normalize_response(response_text)
     mentioned = {int(m) for m in _TXN_ID_RE.findall(response_text)}
     mentioned.discard(seed_txn_id)
     return any(n in mentioned for n in neighbor_txn_ids)
