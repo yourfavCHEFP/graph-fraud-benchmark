@@ -14,9 +14,9 @@ import pandas as pd
 import pytest
 
 from src.graph_fraud_benchmark.responses import (
-    EmptyModelResponseError,
     TASKS,
-    completed_keys_from_frame,
+    EmptyModelResponseError,
+    call_in_fresh_chat,
     completion_key,
     extract_response_text,
     is_complete_response,
@@ -84,7 +84,10 @@ def test_none_empty_and_whitespace_are_incomplete():
 
 def test_real_text_is_stripped_and_complete():
     assert normalize_response("  FRAUD  ") == "FRAUD"
-    assert normalize_response("\nTransaction 12345 did it.\n") == "Transaction 12345 did it."
+    assert (
+        normalize_response("\nTransaction 12345 did it.\n")
+        == "Transaction 12345 did it."
+    )
     assert is_complete_response("  FRAUD ") is True
 
 
@@ -153,6 +156,152 @@ def test_retries_once_on_empty_then_succeeds():
     assert len(calls) == 2, "an empty first response must trigger a fresh request"
 
 
+def test_retry_resends_the_identical_request_in_a_new_chat():
+    """A retry must be a genuinely new request, not a second look at one envelope.
+
+    Regression test for the reported Gemma failure (seed 3488979,
+    classify_transaction): the proxy answered HTTP 200 with a content-less
+    envelope, ``llm.prompt()`` yielded ``""``, and the retry has to re-send
+    the same prompt with the same parameters in a new chat. Verified against
+    the SDK source: ``chats.new()`` always starts with empty history and the
+    provider only ever sees the current chat's messages, so a new chat per
+    attempt is what makes the retry independent -- the ``orphan`` flag only
+    keeps the request out of the task-run transcript.
+    """
+    from contextlib import contextmanager
+
+    opened_chats = []
+    sent_payloads = []
+    responses = [_OpenAIResponseWithoutMessage(), "LEGIT"]
+
+    @contextmanager
+    def chat_factory(name, *, orphan=False):
+        opened_chats.append((name, orphan))
+        yield object()
+
+    class _LLM:
+        def prompt(self, prompt, *, extra_api_params):
+            sent_payloads.append((prompt, extra_api_params))
+            return responses.pop(0)
+
+    attempt = 0
+
+    def call(prompt):
+        nonlocal attempt
+        attempt += 1
+        return call_in_fresh_chat(
+            _LLM(), prompt, chat_factory, "classify_transaction", 3488979, 128, attempt
+        )
+
+    assert (
+        request_response("classification prompt", call, "classify_transaction", 3488979)
+        == "LEGIT"
+    )
+    assert opened_chats == [
+        ("classify_transaction 3488979 attempt 1", True),
+        ("classify_transaction 3488979 attempt 2", True),
+    ]
+    assert sent_payloads == [
+        ("classification prompt", {"max_tokens": 128}),
+        ("classification prompt", {"max_tokens": 128}),
+    ]
+
+
+def test_output_cap_is_a_top_level_max_tokens_param():
+    """The 128-token cap must travel as a top-level provider parameter.
+
+    Pins the wiring shape the SDK documents for ``extra_api_params``: the
+    Kaggle probe showed a doubly-nested ``extra_body`` cap correlating with
+    content-less provider envelopes for this exact prompt, while the same
+    request without it returned text. This test proves only that our code
+    sends the documented shape -- provider behavior must be confirmed by the
+    live single-request check, never by this mock.
+    """
+    from contextlib import contextmanager
+
+    sent_payloads = []
+
+    @contextmanager
+    def chat_factory(name, *, orphan=False):
+        yield object()
+
+    class _LLM:
+        def prompt(self, prompt, *, extra_api_params):
+            sent_payloads.append(extra_api_params)
+            return "LEGIT"
+
+    assert (
+        call_in_fresh_chat(
+            _LLM(),
+            "classification prompt",
+            chat_factory,
+            "classify_transaction",
+            3488979,
+            128,
+            1,
+        )
+        == "LEGIT"
+    )
+    assert sent_payloads == [{"max_tokens": 128}]
+    assert "extra_body" not in sent_payloads[0]
+
+
+def test_double_empty_envelope_aborts_loudly_without_checkpointing():
+    """Both documented empty-envelope shapes, twice, must stop the run loudly.
+
+    The exact reported failure: two consecutive content-less envelopes for one
+    key. The run must raise naming the task and seed, describe BOTH attempts
+    (a transport error and an empty envelope mean different things), prove
+    both attempts re-sent the identical request in distinct chats, and return
+    nothing -- there is no "" for a caller to mistake for a finished row.
+    """
+    from contextlib import contextmanager
+
+    opened_chats = []
+    sent_payloads = []
+    responses = [
+        _OpenAIResponseWithoutMessage(),  # choices[0].message is None
+        _OpenAIResponse(_Message(None)),  # choices present, content null
+    ]
+
+    @contextmanager
+    def chat_factory(name, *, orphan=False):
+        opened_chats.append((name, orphan))
+        yield object()
+
+    class _LLM:
+        def prompt(self, prompt, *, extra_api_params):
+            sent_payloads.append((prompt, extra_api_params))
+            return responses.pop(0)
+
+    attempt = 0
+
+    def call(prompt):
+        nonlocal attempt
+        attempt += 1
+        return call_in_fresh_chat(
+            _LLM(), prompt, chat_factory, "classify_transaction", 3488979, 128, attempt
+        )
+
+    with pytest.raises(EmptyModelResponseError) as excinfo:
+        request_response(
+            "classification prompt", call, "classify_transaction", 3488979
+        )
+    message = str(excinfo.value)
+    assert "classify_transaction" in message
+    assert "3488979" in message
+    assert "attempt 1" in message and "attempt 2" in message
+    assert "choices[0].message is None" in message
+    assert [name for name, _ in opened_chats] == [
+        "classify_transaction 3488979 attempt 1",
+        "classify_transaction 3488979 attempt 2",
+    ]
+    assert sent_payloads == [
+        ("classification prompt", {"max_tokens": 128}),
+        ("classification prompt", {"max_tokens": 128}),
+    ]
+
+
 def test_raises_after_one_retry_and_names_the_failure():
     calls = []
 
@@ -216,8 +365,8 @@ def _rows(n_samples, model=MODEL, response="FRAUD"):
 def test_blank_cells_read_back_as_empty_string_not_nan(tmp_path):
     path = tmp_path / "raw_responses.csv"
     rows = _rows(2)
-    rows[0]["raw_response"] = ""      # genuinely blank cell
-    rows[1]["raw_response"] = "   "   # whitespace only
+    rows[0]["raw_response"] = ""  # genuinely blank cell
+    rows[1]["raw_response"] = "   "  # whitespace only
     pd.DataFrame(rows).to_csv(path, index=False)
 
     frame = read_responses_csv(path)
@@ -247,7 +396,10 @@ def test_resume_skips_completed_keys(tmp_path):
 
     cache = load_response_cache(path, expected_model=MODEL)
     assert len(cache) == 4  # 2 samples x 2 tasks
-    assert cache[completion_key(MODEL, "classify_transaction", 0)]["raw_response"] == "FRAUD"
+    assert (
+        cache[completion_key(MODEL, "classify_transaction", 0)]["raw_response"]
+        == "FRAUD"
+    )
 
 
 def test_blank_cached_rows_are_not_treated_as_completed(tmp_path):
@@ -283,17 +435,19 @@ def test_a_resumed_blank_row_is_recoverable(tmp_path):
         "raw_response": "LEGIT",
     }
     cached_incomplete = [
-        r for r in read_responses_csv(path).to_dict("records")
-        if not r["response_complete"] and completion_key(
-            r["model_name"], r["task"], r["seed_txn_id"]
-        ) not in cache
+        r
+        for r in read_responses_csv(path).to_dict("records")
+        if not r["response_complete"]
+        and completion_key(r["model_name"], r["task"], r["seed_txn_id"]) not in cache
     ]
     write_responses_csv(list(cache.values()) + cached_incomplete, path)
 
     frame = read_responses_csv(path)
     assert len(frame) == 2
     assert frame["response_complete"].all()
-    assert frame.set_index(["task"]).loc["classify_transaction", "raw_response"] == "LEGIT"
+    assert (
+        frame.set_index(["task"]).loc["classify_transaction", "raw_response"] == "LEGIT"
+    )
 
 
 def test_mixing_another_models_cache_raises(tmp_path):
@@ -426,5 +580,7 @@ def test_retry_cap_is_not_relaxed():
             return ""
 
         with pytest.raises(EmptyModelResponseError):
-            request_response("p", call, "identify_ring_root", 7, max_attempts=max_attempts)
+            request_response(
+                "p", call, "identify_ring_root", 7, max_attempts=max_attempts
+            )
         assert len(calls) == max_attempts

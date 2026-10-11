@@ -196,6 +196,48 @@ def request_response(
     )
 
 
+def call_in_fresh_chat(
+    llm,
+    prompt: str,
+    chat_factory,
+    task_name: str,
+    seed_txn_id,
+    max_output_tokens: int,
+    attempt: int,
+) -> str:
+    """Issue one model request in its own chat, separate from the task chat.
+
+    ``Task.run()`` already owns a chat context, and ``request_response``
+    retries by invoking ``call`` again -- so every attempt must open a NEW
+    chat rather than re-inspect the previous attempt's envelope. A fresh
+    ``chats.new()`` always starts with empty history (the SDK sends only the
+    current chat's messages to the provider; parent history is never
+    included), and ``orphan=True`` additionally keeps the request chat out of
+    the task-run transcript. The per-attempt name keeps the two attempts
+    distinguishable in that transcript.
+
+    What this helper does NOT do: it cannot turn an empty provider response
+    into a real one. ``llm.prompt()`` returns ``""`` only when the proxy
+    answers HTTP 200 with an envelope holding no usable content (no choices,
+    or a null/blank message) -- that emptiness originates server-side, and an
+    identical request from any chat shape returns the same ``""``. The cure
+    for a double-empty is the retry-then-raise policy in
+    :func:`request_response`, not the chat flags used here.
+
+    The output cap is passed as a top-level ``max_tokens`` provider
+    parameter -- the shape the SDK documents for ``extra_api_params``. It
+    must not be nested under ``extra_body``: that key is the HTTP client's
+    opaque body-merge hook, and a doubly-nested cap sits outside the
+    provider's API contract.
+    """
+    chat_name = f"{task_name} {seed_txn_id} attempt {attempt}"
+    with chat_factory(chat_name, orphan=True):
+        return llm.prompt(
+            prompt,
+            extra_api_params={"max_tokens": max_output_tokens},
+        )
+
+
 # --- Identity, storage, and resume ----------------------------------------
 
 
@@ -220,9 +262,9 @@ def read_responses_csv(path: Path) -> pd.DataFrame:
         raise ValueError(f"{path} is missing columns: {sorted(missing)}")
     frame["model_name"] = frame["model_name"].map(lambda v: str(v).strip())
     frame["task"] = frame["task"].map(lambda v: str(v).strip())
-    frame["seed_txn_id"] = pd.to_numeric(
-        frame["seed_txn_id"], errors="raise"
-    ).astype("int64")
+    frame["seed_txn_id"] = pd.to_numeric(frame["seed_txn_id"], errors="raise").astype(
+        "int64"
+    )
     frame["raw_response"] = frame["raw_response"].map(normalize_response)
     frame["response_complete"] = frame["raw_response"].ne("")
     return frame
@@ -250,7 +292,9 @@ def completed_keys_from_frame(
         if expected is not None and key[0] != expected:
             foreign.add(key[0])
             continue
-        if not row.get("response_complete", is_complete_response(row.get("raw_response"))):
+        if not row.get(
+            "response_complete", is_complete_response(row.get("raw_response"))
+        ):
             continue
         completed[key] = {
             "model_name": key[0],
@@ -341,7 +385,9 @@ def validate_response_run(
 
     per_task: dict[str, int] = {}
     for task in expected_tasks:
-        task_seeds = {int(seed) for seed in complete.loc[complete["task"] == task, "seed_txn_id"]}
+        task_seeds = {
+            int(seed) for seed in complete.loc[complete["task"] == task, "seed_txn_id"]
+        }
         per_task[task] = len(task_seeds)
         missing = sorted(set(expected_seeds) - task_seeds)
         extra = sorted(task_seeds - set(expected_seeds))
@@ -353,7 +399,9 @@ def validate_response_run(
                 f"non-empty response; missing seeds: {shown}{more}"
             )
         if extra:
-            problems.append(f"{task}: {len(extra)} responses for out-of-scope seeds: {extra[:10]}")
+            problems.append(
+                f"{task}: {len(extra)} responses for out-of-scope seeds: {extra[:10]}"
+            )
 
     if not incomplete.empty:
         blanks = ", ".join(
