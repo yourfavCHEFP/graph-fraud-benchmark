@@ -86,8 +86,8 @@ FEATURE_COLUMNS = [
 class SubgraphSample:
     seed_txn_id: int
     label: int  # ground-truth isFraud for the seed transaction
-    nodes: dict = field(default_factory=dict)   # txn_id -> feature dict
-    edges: list = field(default_factory=list)   # [(txn_id_a, txn_id_b, shared_entity)]
+    nodes: dict = field(default_factory=dict)  # txn_id -> feature dict
+    edges: list = field(default_factory=list)  # [(txn_id_a, txn_id_b, shared_entity)]
 
     def to_json_dict(self) -> dict:
         return {
@@ -95,13 +95,13 @@ class SubgraphSample:
             "label": self.label,
             "num_nodes": len(self.nodes),
             "nodes": self.nodes,
-            "edges": [
-                {"a": a, "b": b, "shared_via": via} for a, b, via in self.edges
-            ],
+            "edges": [{"a": a, "b": b, "shared_via": via} for a, b, via in self.edges],
         }
 
 
-def load_transactions(transactions_csv: Path, identity_csv: Path | None) -> pd.DataFrame:
+def load_transactions(
+    transactions_csv: Path, identity_csv: Path | None
+) -> pd.DataFrame:
     """Load the flat transaction table and, if given, merge identity features."""
     df = pd.read_csv(transactions_csv)
     if identity_csv is not None and identity_csv.exists():
@@ -226,9 +226,19 @@ def sample_one_subgraph(
     return sample
 
 
-def pick_balanced_seeds(df: pd.DataFrame, n_per_class: int, rng: random.Random) -> list[int]:
-    fraud_ids = df.loc[df["isFraud"] == 1, "TransactionID"].tolist()
-    legit_ids = df.loc[df["isFraud"] == 0, "TransactionID"].tolist()
+def pick_balanced_seeds(
+    df: pd.DataFrame,
+    n_per_class: int,
+    rng: random.Random,
+    eligible_seed_ids: set[int] | None = None,
+) -> list[int]:
+    eligible = (
+        df
+        if eligible_seed_ids is None
+        else df[df["TransactionID"].isin(eligible_seed_ids)]
+    )
+    fraud_ids = eligible.loc[eligible["isFraud"] == 1, "TransactionID"].tolist()
+    legit_ids = eligible.loc[eligible["isFraud"] == 0, "TransactionID"].tolist()
     rng.shuffle(fraud_ids)
     rng.shuffle(legit_ids)
     n_fraud = min(n_per_class, len(fraud_ids))
@@ -251,6 +261,8 @@ def run(
     max_subgraph_size: int,
     hub_degree_caps: dict[str, int],
     seed: int,
+    eligible_seed_ids: set[int] | None = None,
+    gnn_predictions: dict[int, float] | None = None,
 ) -> None:
     rng = random.Random(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -263,9 +275,16 @@ def run(
     entity_index = build_entity_index(df, hub_degree_caps=hub_degree_caps)
     txn_to_entities = build_txn_to_entities(entity_index)
 
-    seeds = pick_balanced_seeds(df, n_seeds_per_class, rng)
-    print(f"[sample_subgraphs] sampling {len(seeds)} seed transactions "
-          f"({n_seeds_per_class} fraud + {n_seeds_per_class} legit target)")
+    seeds = pick_balanced_seeds(df, n_seeds_per_class, rng, eligible_seed_ids)
+    print(
+        f"[sample_subgraphs] sampling {len(seeds)} seed transactions "
+        f"({n_seeds_per_class} fraud + {n_seeds_per_class} legit target)"
+    )
+
+    # Validate and plan the new sample set before removing outputs from the
+    # last successful run. Serialization consumes every JSON in this folder.
+    for stale in subgraphs_dir.glob("*.json"):
+        stale.unlink()
 
     labels_rows = []
     for seed_txn_id in seeds:
@@ -288,33 +307,58 @@ def run(
                 "seed_txn_id": seed_txn_id,
                 "label": sample.label,
                 "subgraph_size": len(sample.nodes),
-                # filled in later, once the trained GNN scores these same
-                # subgraphs -- left blank here on purpose so serialize.py
-                # and analysis.py can tell "not yet scored" apart from 0.0
-                "gnn_pred": "",
+                # blank when no prediction file was provided; otherwise
+                # this is the held-out GNN probability for the seed.
+                "gnn_pred": (gnn_predictions or {}).get(seed_txn_id, ""),
             }
         )
 
     labels_path = out_dir / "labels.csv"
-    pd.DataFrame(labels_rows).to_csv(labels_path, index=False)
+    # Atomic write: a crash partway through to_csv() on the real path
+    # would leave a truncated labels.csv that serialize.py or analysis.py
+    # could read as if it were complete. Writing to a temp file in the
+    # same directory and renaming is a single atomic filesystem
+    # operation -- labels.csv either has last run's full content or this
+    # run's full content, never a partial mix of the two.
+    tmp_path = labels_path.with_suffix(".csv.tmp")
+    pd.DataFrame(labels_rows).to_csv(tmp_path, index=False)
+    tmp_path.replace(labels_path)
     print(f"[sample_subgraphs] wrote {len(labels_rows)} subgraphs to {subgraphs_dir}")
     print(f"[sample_subgraphs] wrote ground-truth labels to {labels_path}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--transactions-csv", type=Path, default=Path("data/raw/train_transaction.csv"))
-    parser.add_argument("--identity-csv", type=Path, default=Path("data/raw/train_identity.csv"))
-    parser.add_argument("--out-dir", type=Path, default=Path("data"))
-    parser.add_argument("--n-seeds-per-class", type=int, default=50,
-                         help="How many fraud seeds and how many legit seeds to sample (balanced).")
-    parser.add_argument("--hops", type=int, default=2)
-    parser.add_argument("--max-neighbors-per-entity", type=int, default=4,
-                         help="Cap on neighbors pulled in through any single shared entity.")
-    parser.add_argument("--max-subgraph-size", type=int, default=12,
-                         help="Hard cap on total nodes per subgraph, so prompts stay readable.")
     parser.add_argument(
-        "--hub-degree-cap-override", type=int, default=None,
+        "--transactions-csv", type=Path, default=Path("data/raw/train_transaction.csv")
+    )
+    parser.add_argument(
+        "--identity-csv", type=Path, default=Path("data/raw/train_identity.csv")
+    )
+    parser.add_argument("--out-dir", type=Path, default=Path("data"))
+    parser.add_argument(
+        "--n-seeds-per-class",
+        type=int,
+        default=50,
+        help="How many fraud seeds and how many legit seeds to sample (balanced).",
+    )
+    parser.add_argument("--hops", type=int, default=2)
+    parser.add_argument(
+        "--max-neighbors-per-entity",
+        type=int,
+        default=4,
+        help="Cap on neighbors pulled in through any single shared entity.",
+    )
+    parser.add_argument(
+        "--max-subgraph-size",
+        type=int,
+        default=12,
+        help="Hard cap on total nodes per subgraph, so prompts stay readable.",
+    )
+    parser.add_argument(
+        "--hub-degree-cap-override",
+        type=int,
+        default=None,
         help=(
             "If set, overrides ALL per-entity hub caps with one flat number "
             "(mainly for quick experiments). Default: use HUB_DEGREE_CAPS, "
@@ -323,6 +367,12 @@ def main() -> None:
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--gnn-predictions-csv",
+        type=Path,
+        default=None,
+        help="Optional held-out prediction CSV; restricts seeds to its TransactionIDs.",
+    )
     args = parser.parse_args()
 
     hub_degree_caps = (
@@ -332,6 +382,18 @@ def main() -> None:
     )
 
     identity_csv = args.identity_csv if args.identity_csv.exists() else None
+    eligible_seed_ids = None
+    gnn_predictions = None
+    if args.gnn_predictions_csv is not None:
+        predictions = pd.read_csv(args.gnn_predictions_csv)
+        required = {"TransactionID", "gnn_pred"}
+        missing = required - set(predictions.columns)
+        if missing:
+            raise ValueError(f"GNN predictions file is missing columns: {missing}")
+        eligible_seed_ids = set(predictions["TransactionID"].astype(int))
+        gnn_predictions = dict(
+            zip(predictions["TransactionID"].astype(int), predictions["gnn_pred"])
+        )
     run(
         transactions_csv=args.transactions_csv,
         identity_csv=identity_csv,
@@ -342,6 +404,8 @@ def main() -> None:
         max_subgraph_size=args.max_subgraph_size,
         hub_degree_caps=hub_degree_caps,
         seed=args.seed,
+        eligible_seed_ids=eligible_seed_ids,
+        gnn_predictions=gnn_predictions,
     )
 
 

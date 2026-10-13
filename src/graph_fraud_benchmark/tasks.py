@@ -19,33 +19,38 @@ TWO QUESTIONS PER SAMPLE
    this one transaction look weird in isolation" -- which is the
    whole point of the benchmark.
 
+   DECIDED SCOPE: IEEE-CIS has no ground-truth "ring leader" label, so
+   this task does NOT measure "did the model find the true root cause."
+   It measures a narrower, code-verifiable proxy instead: did the model
+   point at some OTHER transaction that is itself independently labeled
+   fraudulent (see assertions.score_ring_root). That's a real signal --
+   pointing at a known-fraud neighbor beats pointing at a known-legit
+   one or hallucinating an ID -- but report it in the write-up as
+   exactly that proxy, not as "ring leader detection accuracy."
+
 WHY THE LOGIC IS SPLIT FROM THE DECORATED FUNCTIONS
 ====================================================
-kbench's exact task-calling contract -- what keyword arguments it
-passes in, whether it wants a return value or an assertion -- can only
-be confirmed by hand inside a live Kaggle notebook; that's not
-something verifiable from here. So every task below is a thin wrapper
-around a plain function (_classify_logic, _ring_root_logic) that is
-fully testable on its own, with zero kbench dependency. If kbench's
-real signature turns out to differ once you're on Kaggle, only the
-thin @task wrapper needs adjusting -- the parsing logic underneath,
-already tested below, does not.
+Kaggle's LLM transport and task registration use the documented
+`llm.prompt()` and `@kbench.task` APIs. Parsing remains in plain
+functions (_classify_logic, _ring_root_logic), so it can be tested
+without a Kaggle runtime or model credentials.
 """
-
-from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 
+from .responses import is_complete_response, normalize_response
+
 try:
-    import kbench
-except ImportError:  # kbench is only installed in the Kaggle runtime
+    import kaggle_benchmarks as kbench
+except ImportError:  # kaggle-benchmarks is preinstalled in Kaggle task notebooks
     kbench = None
 
 
-def _noop_task_decorator(fn):
-    """Stand-in for @kbench.task so this file still imports and is
-    testable outside Kaggle, where the real package isn't installed."""
+def _noop_task_decorator(fn=None, **_kwargs):
+    """Stand-in for @kbench.task so logic remains testable outside Kaggle."""
+    if fn is None:
+        return lambda decorated: decorated
     return fn
 
 
@@ -89,7 +94,14 @@ def _classify_logic(response_text: str) -> ClassificationResult:
     as "clear" -- a response matching both keyword sets, or neither,
     is flagged "ambiguous" so assertions.py can treat it as unscorable
     rather than silently guessing what the model meant.
+
+    response_text is normalized first: a blank cell read back from a results
+    CSV arrives as float('nan'), and calling .upper() on it raises
+    AttributeError. A blank response normalizes to "", matches neither
+    keyword set, and therefore lands on "ambiguous" -- unscorable, never
+    silently wrong.
     """
+    response_text = normalize_response(response_text)
     upper = response_text.upper()
     negated_fraud = _NEGATED_FRAUD_RE.search(upper) is not None
     # check the plain FRAUD keyword only against text with "NOT FRAUD"
@@ -105,13 +117,14 @@ def _classify_logic(response_text: str) -> ClassificationResult:
     return ClassificationResult(has_fraud, response_text, "ambiguous")
 
 
-@task
-def classify_transaction(model, serialized_subgraph: str) -> bool:
-    """Kaggle Benchmarks entry point for question 1.
-    Real logic lives in _classify_logic, tested independently of kbench."""
+@task(name="classify_transaction")
+def classify_transaction(llm, serialized_subgraph: str, true_label: int) -> bool:
+    """Ask Kaggle's LLM to classify a transaction and score its verdict."""
     prompt = build_classification_prompt(serialized_subgraph)
-    response = model.generate(prompt)
-    return _classify_logic(response.text).predicted_fraud
+    parsed = _classify_logic(llm.prompt(prompt))
+    if parsed.parse_confidence == "ambiguous":
+        return False
+    return parsed.predicted_fraud == bool(true_label)
 
 
 # --- Question 2: identify_ring_root ------------------------------------
@@ -131,26 +144,55 @@ def build_ring_root_prompt(serialized_subgraph: str) -> str:
     )
 
 
-def _ring_root_logic(response_text: str, valid_txn_ids: list[int]) -> int | None:
+def _ring_root_logic(
+    response_text: str, valid_txn_ids: list[int], seed_txn_id: int
+) -> int | None:
     """
     Pull a transaction ID out of the model's answer -- but only if it's
-    actually a node that existed in this subgraph. Models do hallucinate
-    IDs they were never shown, and a hallucinated ID is a wrong answer,
-    not a lucky guess that happens to parse.
+    actually a node that existed in this subgraph, AND it isn't the
+    seed transaction itself. Models do hallucinate IDs they were never
+    shown (a hallucinated ID is a wrong answer, not a lucky guess that
+    happens to parse) -- and the prompt explicitly asks which OTHER
+    transaction looks responsible, so the seed answering for itself is
+    just as wrong, not a trivially-true match.
+
+    seed_txn_id is required, not optional, specifically so this
+    exclusion can't be forgotten at a call site -- it was, once:
+    valid_txn_ids as built by serialize.py includes the seed, and an
+    earlier version of this function didn't filter it out, so a fraud
+    seed could be scored as correctly identifying itself as the ring
+    root.
+
+    An empty response returns None, but callers must not read that as a
+    deliberate "NONE" answer -- for a legit seed, None is the *expected*
+    reply and would otherwise be scored correct. Use
+    is_complete_response() to tell a blank apart from a real "NONE";
+    analysis.py and the notebook both gate on it before scoring.
     """
-    if "NONE" in response_text.upper():
+    response_text = normalize_response(response_text)
+    candidates = [t for t in valid_txn_ids if t != seed_txn_id]
+    if re.search(r"\bNONE\b", response_text.upper()):
         return None
     for match in _TXN_ID_RE.findall(response_text):
         candidate = int(match)
-        if candidate in valid_txn_ids:
+        if candidate in candidates:
             return candidate
-    return None  # mentioned something, but never an ID that was in the prompt
+    return None  # mentioned something, but never a valid OTHER transaction ID
 
 
-@task
-def identify_ring_root(model, serialized_subgraph: str, valid_txn_ids: list[int]):
-    """Kaggle Benchmarks entry point for question 2.
-    Real logic lives in _ring_root_logic, tested independently of kbench."""
+@task(name="identify_ring_root")
+def identify_ring_root(
+    llm,
+    serialized_subgraph: str,
+    valid_txn_ids: list[int],
+    seed_txn_id: int,
+    seed_true_label: int,
+    fraud_txn_ids: list[int],
+) -> bool:
+    """Score the disclosed proxy: selecting another known-fraud node."""
     prompt = build_ring_root_prompt(serialized_subgraph)
-    response = model.generate(prompt)
-    return _ring_root_logic(response.text, valid_txn_ids)
+    predicted_id = _ring_root_logic(llm.prompt(prompt), valid_txn_ids, seed_txn_id)
+    node_is_fraud = {int(txn_id): 1 for txn_id in fraud_txn_ids}
+    if seed_true_label == 0:
+        return predicted_id is None
+    return predicted_id is not None and node_is_fraud.get(predicted_id) == 1

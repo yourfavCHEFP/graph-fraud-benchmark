@@ -3,7 +3,7 @@
 > Can an LLM out-reason a Graph Neural Network on fraud?
 
 [![kaggle](https://img.shields.io/badge/Kaggle-Benchmarking%20Challenge-20BEFF?logo=kaggle&logoColor=white)](https://kaggle.com/benchmarks)
-[![deadline](https://img.shields.io/badge/deadline-Oct%2011%202026-red)]()
+[![deadline](https://img.shields.io/badge/deadline-Oct%2011%202026-red)](https://www.kaggle.com/benchmarks)
 [![built on](https://img.shields.io/badge/built%20on-graph--fraud--ai-8B5CF6)](https://github.com/yourfavCHEFP/graph-fraud-ai)
 [![license](https://img.shields.io/badge/license-Apache--2.0-green)](./LICENSE)
 
@@ -11,7 +11,7 @@
 
 A trained heterogeneous GNN catches fraud by reading the *shape* of a transaction network — shared devices, chained transfers, ring structures — not just a single transaction's features. This benchmark asks: **can a general-purpose LLM catch the same thing, if you just describe the graph to it in words?**
 
-Every test case is a real subgraph pulled from the IEEE-CIS fraud dataset, serialized into plain text, with the label stripped out. Every case also carries the GNN's own prediction, so a wrong LLM answer can be split into two very different stories: *"missed what the GNN also missed"* vs. *"missed what the GNN caught by actually using graph structure."*
+Every test case is a real subgraph pulled from the IEEE-CIS fraud dataset, serialized into plain text, with the label stripped out. Each held-out seed also carries the GNN's fraud probability, so LLM errors can be compared with GNN errors. The ring-root task is scored using a proxy: whether the model selects another transaction independently labeled fraudulent, not whether it finds a verified ring leader.
 
 ## How it works
 
@@ -27,33 +27,36 @@ See `docs/diagrams/kaggle-file-sequence.svg` for the build order, or the project
 
 ## Quick start
 
-\`\`\`bash
+```bash
 git clone https://github.com/yourfavCHEFP/graph-fraud-benchmark.git
 cd graph-fraud-benchmark
 pip install -r requirements.txt
 
-python -m src.graph_fraud_benchmark.sample_subgraphs
+# Place the IEEE-CIS training CSVs in data/raw/ and matching GNN artifacts in data/gnn/.
+python -m src.graph_fraud_benchmark.gnn_predictions
+python -m src.graph_fraud_benchmark.sample_subgraphs \
+  --gnn-predictions-csv data/gnn/test_predictions.csv
 python -m src.graph_fraud_benchmark.serialize
-\`\`\`
+```
 
-Then open `notebooks/kaggle_benchmark_task.ipynb` on Kaggle to run the actual benchmark against the model lineup.
+Then open `notebooks/kaggle_benchmark_task.ipynb` on Kaggle and attach the IEEE-CIS dataset and matching GNN artifacts. Raw data, model artifacts, generated prompts, and mock outputs are local-only and ignored by Git. The notebook uses mock models by default for pipeline checks; set `USE_MOCK = False` in Kaggle to query the model lineup and produce the real results file.
 
 ## Model lineup
 
 | Model | Why it's here |
-|---|---|
-| *(frontier reasoning model)* | Ceiling check — does more reasoning budget close the gap? |
-| *(fast/cheap general model)* | Baseline — what does an "average" model catch? |
-| *(open-weight model, e.g. DeepSeek)* | Is this a frontier-only capability or architecture-agnostic? |
+| --- | --- |
+| Gemini 2.5 Pro | Ceiling check — does more reasoning budget close the gap? |
+| Gemini 2.5 Flash | Baseline — what does an "average" model catch? |
+| Gemma 4 31B | Is this a frontier-only capability or architecture-agnostic? |
 
 ## Results
 
-_Filled in after the benchmark run — see `results/leaderboard_export.json` and `writeup/devto_submission.md`._
+*Filled in after the benchmark run — see `results/leaderboard_export.json` and `writeup/devto_submission.md`.*
 
 ## Links
 
-- Kaggle notebook: _add link once published_
-- dev.to write-up: _add link once published_
+- Kaggle notebook: *add link once published*
+- dev.to write-up: *add link once published*
 
 ## Author
 
